@@ -31,6 +31,9 @@ struct ImageViewHandle {
 struct ImageViewDescriptors {
 	ImageViewInfo               info;
 	uint32_t                    resource = 0; // index into ImageBacking::resources
+	// A sampled 2D view of one layer other than the first reads a single-layer copy of that layer
+	// (ImageResource::layer), since a Texture2D SRV always reads its resource's first array slice.
+	uint32_t                    layer_resource = UINT32_MAX;
 	D3D12_CPU_DESCRIPTOR_HANDLE srv {};
 	D3D12_CPU_DESCRIPTOR_HANDLE uav {};
 	D3D12_CPU_DESCRIPTOR_HANDLE rtv {};
@@ -49,6 +52,9 @@ struct ImageResource {
 	uint64_t                           version = 0; // contents are current when equal to the image's
 	// In CPU-visible memory, written by the CPU (GraphicContext::cpu_written_block_arrays).
 	bool                               cpu_written = false;
+	// UINT32_MAX: the whole image. Otherwise a read-only, single-layer copy of this layer of the
+	// image (one subresource per level), refreshed from the current resource before it is sampled.
+	uint32_t                           layer = UINT32_MAX;
 };
 
 // The host resources of an image. D3D12 views must share their resource's format family, so an

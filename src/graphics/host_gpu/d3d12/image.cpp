@@ -251,7 +251,8 @@ uint32_t Image::ResourceIndex(vk::Format view_format) {
 	const auto format = D3D12::GetFormatInfo(view_format);
 	EXIT_IF(!format.Supported());
 	for (uint32_t i = 0; i < backing.resources.size(); i++) {
-		if (backing.resources[i].family == format.family) {
+		if (backing.resources[i].family == format.family &&
+		    backing.resources[i].layer == UINT32_MAX) {
 			return i;
 		}
 	}
@@ -312,6 +313,77 @@ uint32_t Image::ResourceIndex(vk::Format view_format) {
 	return static_cast<uint32_t>(backing.resources.size() - 1);
 }
 
+// A Texture2D SRV always reads the first array slice of its resource, and the shader's Texture2D
+// cannot take a Texture2DArray SRV. Sampled color 2D views of a later layer of a 2D array read a
+// single-layer copy of that layer instead.
+bool Image::ReadsLayerCopy(const ImageViewInfo& view_info) const {
+	return view_info.type == vk::ImageViewType::e2D && view_info.base_layer != 0 &&
+	       view_info.base_layer < backing.layers && backing.image_type == vk::ImageType::e2D &&
+	       backing.samples == 1 && backing.planes == 1 &&
+	       view_info.aspect == vk::ImageAspectFlagBits::eColor &&
+	       !(view_info.usage & vk::ImageUsageFlagBits::eStorage);
+}
+
+uint32_t Image::ResourceSubresource(uint32_t resource, uint32_t level, uint32_t layer,
+                                    uint32_t plane) const {
+	if (backing.resources[resource].layer != UINT32_MAX) {
+		return level + plane * backing.mip_levels; // one layer
+	}
+	return backing.Subresource(level, layer, plane);
+}
+
+uint32_t Image::LayerResource(ImageViewHandle handle) {
+	auto& view = backing.views[handle.index];
+	if (view.layer_resource != UINT32_MAX) {
+		return view.layer_resource;
+	}
+	const auto layer  = view.info.base_layer;
+	const auto format = D3D12::GetFormatInfo(view.info.format);
+	EXIT_IF(!format.Supported());
+	for (uint32_t i = 0; i < backing.resources.size(); i++) {
+		if (backing.resources[i].family == format.family && backing.resources[i].layer == layer) {
+			view.layer_resource = i;
+			return i;
+		}
+	}
+
+	D3D12_RESOURCE_DESC desc {};
+	desc.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+	desc.Width            = backing.extent.width;
+	desc.Height           = backing.extent.height;
+	desc.DepthOrArraySize = 1;
+	desc.MipLevels        = static_cast<UINT16>(backing.mip_levels);
+	desc.Format           = format.family;
+	desc.SampleDesc.Count = 1;
+	desc.Flags            = D3D12_RESOURCE_FLAG_NONE; // only copied to and sampled
+
+	D3D12MA::ALLOCATION_DESC allocation {};
+	allocation.HeapType = D3D12_HEAP_TYPE_DEFAULT;
+	ImageResource resource;
+	resource.family   = format.family;
+	resource.layer    = layer;
+	const auto result = m_graphics.allocator->CreateResource(
+	    &allocation, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, &resource.allocation, IID_NULL,
+	    nullptr);
+	if (FAILED(result)) {
+		m_graphics.LogMemoryBudget();
+		EXIT("D3D12: failed to create the copy of image layer %u: extent=%ux%u format=%d "
+		     "family=%d levels=%u, HRESULT=0x%08x\n",
+		     layer, backing.extent.width, backing.extent.height, static_cast<int>(view.info.format),
+		     static_cast<int>(format.family), backing.mip_levels, static_cast<uint32_t>(result));
+	}
+	resource.resource = resource.allocation->GetResource();
+	resource.states.assign(backing.mip_levels * backing.planes, D3D12_RESOURCE_STATE_COMMON);
+	backing.resources.push_back(std::move(resource));
+	view.layer_resource = static_cast<uint32_t>(backing.resources.size() - 1);
+	static std::atomic_bool reported = false;
+	if (!reported.exchange(true)) {
+		Log::WriteToConsoleAndLog(
+		    "D3D12: sampled 2D views of a later array layer read a copy of that layer\n");
+	}
+	return view.layer_resource;
+}
+
 void Image::Transition(CommandBuffer& command, uint32_t resource, uint32_t state,
                        std::optional<ImageSubresourceRange> range) {
 	auto&      target = backing.resources[resource];
@@ -332,10 +404,12 @@ void Image::Transition(CommandBuffer& command, uint32_t resource, uint32_t state
 		range->level_count = end - skip - range->base_level;
 	}
 	const bool volume = backing.image_type == vk::ImageType::e3D;
+	const bool one    = volume || target.layer != UINT32_MAX; // a single array slice
 	const auto levels = range ? ImageSubresourceRange {range->base_level, range->level_count,
-	                                                   volume ? 0 : range->base_layer,
-	                                                   volume ? 1 : range->layer_count}
-	                          : ImageSubresourceRange {0, backing.mip_levels, 0, backing.layers};
+	                                                   one ? 0 : range->base_layer,
+	                                                   one ? 1 : range->layer_count}
+	                          : ImageSubresourceRange {0, backing.mip_levels, 0,
+	                                                   one ? 1u : backing.layers};
 
 	std::vector<D3D12_RESOURCE_BARRIER> barriers;
 	for (uint32_t plane = 0; plane < backing.planes; plane++) {
@@ -343,7 +417,7 @@ void Image::Transition(CommandBuffer& command, uint32_t resource, uint32_t state
 		     level++) {
 			for (uint32_t layer = levels.base_layer;
 			     layer < levels.base_layer + levels.layer_count; layer++) {
-				const auto index  = backing.Subresource(level, layer, plane);
+				const auto index  = ResourceSubresource(resource, level, layer, plane);
 				auto&      before = target.states[index];
 				if (before == after) {
 					continue;
@@ -378,12 +452,20 @@ void Image::Synchronize(CommandBuffer& command, uint32_t resource) {
 	}
 	const auto source = backing.current;
 	EXIT_IF(source == resource);
+	EXIT_IF(backing.resources[source].layer != UINT32_MAX);
+	const auto                 layer = backing.resources[resource].layer;
 	std::vector<vk::ImageCopy> copies;
 	const auto                 aspect = FullAspectMask(backing.format) & ~vk::ImageAspectFlagBits::eStencil;
 	for (uint32_t level = 0; level < backing.mip_levels; level++) {
 		vk::ImageCopy copy {};
-		copy.srcSubresource = {aspect, level, 0, backing.layers};
-		copy.dstSubresource = copy.srcSubresource;
+		if (layer == UINT32_MAX) {
+			copy.srcSubresource = {aspect, level, 0, backing.layers};
+			copy.dstSubresource = copy.srcSubresource;
+		} else {
+			// The copy of one layer: that layer of the current resource, to its only layer.
+			copy.srcSubresource = {aspect, level, layer, 1};
+			copy.dstSubresource = {aspect, level, 0, 1};
+		}
 		copy.extent         = {std::max(backing.extent.width >> level, 1u),
 		                       std::max(backing.extent.height >> level, 1u),
 		                       std::max(backing.extent.depth >> level, 1u)};
@@ -395,7 +477,16 @@ void Image::Synchronize(CommandBuffer& command, uint32_t resource) {
 
 void Image::Use(CommandBuffer& command, uint32_t state, std::optional<ImageSubresourceRange> range,
                 std::optional<ImageViewHandle> view) {
-	const auto resource = view ? backing.views[view->index].resource : backing.current;
+	auto       resource = view ? backing.views[view->index].resource : backing.current;
+	const auto states   = static_cast<D3D12_RESOURCE_STATES>(state);
+	if (view && !IsWriteState(states) &&
+	    (states & (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+	               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)) != 0 &&
+	    ReadsLayerCopy(backing.views[view->index].info)) {
+		// Sampled through the copy of its layer (ShaderResourceView), which holds every level.
+		resource = LayerResource(*view);
+		range    = std::nullopt;
+	}
 	Synchronize(command, resource);
 	Transition(command, resource, state, range);
 	if (IsWriteState(static_cast<D3D12_RESOURCE_STATES>(state))) {
@@ -432,6 +523,8 @@ D3D12_CPU_DESCRIPTOR_HANDLE Image::ShaderResourceView(ImageViewHandle handle) {
 	const bool  stencil    = info.aspect == vk::ImageAspectFlagBits::eStencil;
 	const bool  depth      = info.aspect == vk::ImageAspectFlagBits::eDepth;
 	const bool  multisample = backing.samples > 1;
+	const bool  layer_copy  = ReadsLayerCopy(info);
+	const auto  resource    = layer_copy ? LayerResource(handle) : view.resource;
 
 	D3D12_SHADER_RESOURCE_VIEW_DESC desc {};
 	desc.Format = stencil ? image.stencil_view : depth ? image.view : format.view;
@@ -457,8 +550,8 @@ D3D12_CPU_DESCRIPTOR_HANDLE Image::ShaderResourceView(ImageViewHandle handle) {
 			break;
 		case vk::ImageViewType::e2D:
 			// The view dimension must match the shader's Texture2D, which always reads the
-			// resource's first array slice.
-			EXIT_NOT_IMPLEMENTED(info.base_layer != 0);
+			// resource's first array slice: a later layer is read from its own copy (Use).
+			EXIT_NOT_IMPLEMENTED(info.base_layer != 0 && !layer_copy);
 			if (multisample) {
 				desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
 			} else {
@@ -509,7 +602,7 @@ D3D12_CPU_DESCRIPTOR_HANDLE Image::ShaderResourceView(ImageViewHandle handle) {
 	}
 	view.srv = m_scheduler.Context().GetDescriptorHeap().AllocateCpu(
 	    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-	m_graphics.device->CreateShaderResourceView(backing.resources[view.resource].resource, &desc,
+	m_graphics.device->CreateShaderResourceView(backing.resources[resource].resource, &desc,
 	                                            view.srv);
 	return view.srv;
 }
@@ -960,10 +1053,10 @@ void Image::CopyContents(CommandBuffer& command, Image& source, uint32_t source_
 			    copy.srcSubresource.mipLevel,
 			    source_volume ? 0 : copy.srcSubresource.baseArrayLayer + i,
 			    Plane(copy.srcSubresource.aspectMask));
-			region.destination_subresource =
-			    backing.Subresource(copy.dstSubresource.mipLevel,
-			                        destination_volume ? 0 : copy.dstSubresource.baseArrayLayer + i,
-			                        Plane(copy.dstSubresource.aspectMask));
+			region.destination_subresource = ResourceSubresource(
+			    destination_resource, copy.dstSubresource.mipLevel,
+			    destination_volume ? 0 : copy.dstSubresource.baseArrayLayer + i,
+			    Plane(copy.dstSubresource.aspectMask));
 			const auto source_z =
 			    static_cast<UINT>(copy.srcOffset.z) + (source_volume && !destination_volume ? i : 0);
 			const auto width  = static_cast<UINT>(DivCeil(copy.extent.width, block.width) * block.width);
