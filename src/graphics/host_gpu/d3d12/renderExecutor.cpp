@@ -139,23 +139,33 @@ void RenderExecutor::CommitBindings(CommandBuffer& buffer, bool graphics,
 	    graphics ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
 	                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
 	             : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+	// Storage images last: a shader's writes to the copy of a later array layer are copied back
+	// when its image is next used another way (Image::Use), which must not come before the draw.
+	for (const bool storage_pass: {false, true}) {
+		for (auto* prepared: stages) {
+			EXIT_IF(prepared == nullptr);
+			for (auto& binding: prepared->images) {
+				const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
+				if (storage != storage_pass) {
+					continue;
+				}
+				auto&       image = cache.GetImage(binding.image_id);
+				const auto& view  = binding.desc.view_info;
+				const auto  state = storage                             ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+				                    : binding.image_id == m_read_only_depth ? ReadOnlyDepthState
+				                                                          : sampled_state;
+				image.Use(buffer, state,
+				          ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
+				                                 view.layer_count},
+				          binding.image_view);
+			}
+		}
+	}
 	// Descriptors follow the root layout: stages in order, their bindings in declaration order.
 	for (auto* prepared: stages) {
 		EXIT_IF(prepared == nullptr || prepared->runtime == nullptr || !*prepared->runtime);
 		const auto& program = *prepared->runtime->program;
 		auto&       images  = prepared->images;
-		for (auto& binding: images) {
-			auto&       image   = cache.GetImage(binding.image_id);
-			const auto& view    = binding.desc.view_info;
-			const bool  storage = binding.desc.type == TextureCache::BindingType::Storage;
-			const auto  state   = storage                             ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
-			                      : binding.image_id == m_read_only_depth ? ReadOnlyDepthState
-			                                                            : sampled_state;
-			image.Use(buffer, state,
-			          ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
-			                                 view.layer_count},
-			          binding.image_view);
-		}
 
 		// The bindings in kind order (RootLayout::Add). An image binding holds each image's mips at
 		// the image's descriptor index; they are written after the bindings are laid out.

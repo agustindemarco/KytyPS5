@@ -31,8 +31,9 @@ struct ImageViewHandle {
 struct ImageViewDescriptors {
 	ImageViewInfo               info;
 	uint32_t                    resource = 0; // index into ImageBacking::resources
-	// A sampled 2D view of one layer other than the first reads a single-layer copy of that layer
-	// (ImageResource::layer), since a Texture2D SRV always reads its resource's first array slice.
+	// A 2D view of one layer other than the first that shaders sample or write uses a single-layer
+	// copy of that layer (ImageResource::layer), since a Texture2D SRV or RWTexture2D UAV always
+	// reaches its resource's first array slice.
 	uint32_t                    layer_resource = UINT32_MAX;
 	D3D12_CPU_DESCRIPTOR_HANDLE srv {};
 	D3D12_CPU_DESCRIPTOR_HANDLE uav {};
@@ -52,8 +53,9 @@ struct ImageResource {
 	uint64_t                           version = 0; // contents are current when equal to the image's
 	// In CPU-visible memory, written by the CPU (GraphicContext::cpu_written_block_arrays).
 	bool                               cpu_written = false;
-	// UINT32_MAX: the whole image. Otherwise a read-only, single-layer copy of this layer of the
-	// image (one subresource per level), refreshed from the current resource before it is sampled.
+	// UINT32_MAX: the whole image. Otherwise a single-layer copy of this layer of the image (one
+	// subresource per level), refreshed from the current resource before it is sampled or written,
+	// and copied back to it after shaders wrote it (ImageBacking::layer_writes).
 	uint32_t                           layer = UINT32_MAX;
 };
 
@@ -80,6 +82,9 @@ struct ImageBacking {
 	std::vector<ImageViewDescriptors> views;
 	uint64_t                   version = 1; // bumped by every write to the current resource
 	uint32_t                   current = 0; // resource holding the latest contents
+	// Layer copies shaders wrote: newer than their layer of the current resource until the image is
+	// next used another way (Image::FlushLayerWrites).
+	std::vector<uint32_t>      layer_writes;
 
 	[[nodiscard]] uint32_t Subresource(uint32_t level, uint32_t layer, uint32_t plane) const {
 		const uint32_t array_size = image_type == vk::ImageType::e3D ? 1u : layers;

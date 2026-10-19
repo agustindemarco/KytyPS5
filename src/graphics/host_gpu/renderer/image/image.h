@@ -215,13 +215,14 @@ private:
 #if defined(KYTY_GPU_BACKEND_D3D12)
 	struct BufferRegion;
 	[[nodiscard]] uint32_t ResourceIndex(vk::Format view_format);
-	[[nodiscard]] bool     ReadsLayerCopy(const ImageViewInfo& view_info) const;
+	[[nodiscard]] bool     UsesLayerCopy(const ImageViewInfo& view_info) const;
 	[[nodiscard]] uint32_t LayerResource(ImageViewHandle view);
 	[[nodiscard]] uint32_t ResourceSubresource(uint32_t resource, uint32_t level, uint32_t layer,
 	                                           uint32_t plane) const;
 	void                   Transition(CommandBuffer& command, uint32_t resource, uint32_t state,
 	                                  std::optional<ImageSubresourceRange> range);
 	void                   Synchronize(CommandBuffer& command, uint32_t resource);
+	void                   FlushLayerWrites(CommandBuffer& command);
 	void CopyRegions(CommandBuffer& command, std::span<const vk::BufferImageCopy> copies,
 	                 BufferHandle buffer, bool upload);
 	void UploadWithCpu(CommandBuffer& command, std::span<const vk::BufferImageCopy> copies,

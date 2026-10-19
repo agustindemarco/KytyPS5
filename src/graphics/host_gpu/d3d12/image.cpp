@@ -313,15 +313,14 @@ uint32_t Image::ResourceIndex(vk::Format view_format) {
 	return static_cast<uint32_t>(backing.resources.size() - 1);
 }
 
-// A Texture2D SRV always reads the first array slice of its resource, and the shader's Texture2D
-// cannot take a Texture2DArray SRV. Sampled color 2D views of a later layer of a 2D array read a
-// single-layer copy of that layer instead.
-bool Image::ReadsLayerCopy(const ImageViewInfo& view_info) const {
+// A Texture2D SRV or RWTexture2D UAV always reaches the first array slice of its resource, and the
+// shader's Texture2D cannot take a Texture2DArray view. Color 2D views of a later layer of a 2D
+// array that shaders sample or write use a single-layer copy of that layer instead.
+bool Image::UsesLayerCopy(const ImageViewInfo& view_info) const {
 	return view_info.type == vk::ImageViewType::e2D && view_info.base_layer != 0 &&
 	       view_info.base_layer < backing.layers && backing.image_type == vk::ImageType::e2D &&
 	       backing.samples == 1 && backing.planes == 1 &&
-	       view_info.aspect == vk::ImageAspectFlagBits::eColor &&
-	       !(view_info.usage & vk::ImageUsageFlagBits::eStorage);
+	       view_info.aspect == vk::ImageAspectFlagBits::eColor;
 }
 
 uint32_t Image::ResourceSubresource(uint32_t resource, uint32_t level, uint32_t layer,
@@ -355,7 +354,9 @@ uint32_t Image::LayerResource(ImageViewHandle handle) {
 	desc.MipLevels        = static_cast<UINT16>(backing.mip_levels);
 	desc.Format           = format.family;
 	desc.SampleDesc.Count = 1;
-	desc.Flags            = D3D12_RESOURCE_FLAG_NONE; // only copied to and sampled
+	// Copied to and from, sampled, and written by shaders when its family can be.
+	desc.Flags = backing.resources[view.resource].resource->GetDesc().Flags &
+	             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 
 	D3D12MA::ALLOCATION_DESC allocation {};
 	allocation.HeapType = D3D12_HEAP_TYPE_DEFAULT;
@@ -379,7 +380,7 @@ uint32_t Image::LayerResource(ImageViewHandle handle) {
 	static std::atomic_bool reported = false;
 	if (!reported.exchange(true)) {
 		Log::WriteToConsoleAndLog(
-		    "D3D12: sampled 2D views of a later array layer read a copy of that layer\n");
+		    "D3D12: 2D views of a later array layer that shaders sample or write use a copy of that layer\n");
 	}
 	return view.layer_resource;
 }
@@ -475,18 +476,58 @@ void Image::Synchronize(CommandBuffer& command, uint32_t resource) {
 	backing.resources[resource].version = backing.version;
 }
 
+// Copies the layer copies shaders wrote back to their layer of the current resource.
+void Image::FlushLayerWrites(CommandBuffer& command) {
+	if (backing.layer_writes.empty()) {
+		return;
+	}
+	const auto aspect = FullAspectMask(backing.format) & ~vk::ImageAspectFlagBits::eStencil;
+	backing.version++;
+	for (const auto resource: backing.layer_writes) {
+		std::vector<vk::ImageCopy> copies;
+		for (uint32_t level = 0; level < backing.mip_levels; level++) {
+			vk::ImageCopy copy {};
+			copy.srcSubresource = {aspect, level, 0, 1};
+			copy.dstSubresource = {aspect, level, backing.resources[resource].layer, 1};
+			copy.extent         = {std::max(backing.extent.width >> level, 1u),
+			                       std::max(backing.extent.height >> level, 1u), 1u};
+			copies.push_back(copy);
+		}
+		CopyContents(command, *this, resource, backing.current, copies);
+		backing.resources[resource].version = backing.version;
+	}
+	backing.resources[backing.current].version = backing.version;
+	backing.layer_writes.clear();
+}
+
 void Image::Use(CommandBuffer& command, uint32_t state, std::optional<ImageSubresourceRange> range,
                 std::optional<ImageViewHandle> view) {
 	auto       resource = view ? backing.views[view->index].resource : backing.current;
 	const auto states   = static_cast<D3D12_RESOURCE_STATES>(state);
-	if (view && !IsWriteState(states) &&
-	    (states & (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
-	               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)) != 0 &&
-	    ReadsLayerCopy(backing.views[view->index].info)) {
-		// Sampled through the copy of its layer (ShaderResourceView), which holds every level.
+	const bool storage  = states == D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+	const bool sampled  = !IsWriteState(states) &&
+	                     (states & (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+	                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)) != 0;
+	const bool layer_copy =
+	    view && (storage || sampled) && UsesLayerCopy(backing.views[view->index].info);
+	if (layer_copy) {
+		// Sampled or written through the copy of its layer (ShaderResourceView,
+		// UnorderedAccessView), which holds every level.
 		resource = LayerResource(*view);
 		range    = std::nullopt;
 	}
+	if (layer_copy && storage) {
+		// The shader's writes stay in the copy until the image is next used another way, so other
+		// layers the same dispatch writes keep theirs too (FlushLayerWrites).
+		if (std::find(backing.layer_writes.begin(), backing.layer_writes.end(), resource) ==
+		    backing.layer_writes.end()) {
+			Synchronize(command, resource);
+			backing.layer_writes.push_back(resource);
+		}
+		Transition(command, resource, state, range);
+		return;
+	}
+	FlushLayerWrites(command);
 	Synchronize(command, resource);
 	Transition(command, resource, state, range);
 	if (IsWriteState(static_cast<D3D12_RESOURCE_STATES>(state))) {
@@ -523,7 +564,7 @@ D3D12_CPU_DESCRIPTOR_HANDLE Image::ShaderResourceView(ImageViewHandle handle) {
 	const bool  stencil    = info.aspect == vk::ImageAspectFlagBits::eStencil;
 	const bool  depth      = info.aspect == vk::ImageAspectFlagBits::eDepth;
 	const bool  multisample = backing.samples > 1;
-	const bool  layer_copy  = ReadsLayerCopy(info);
+	const bool  layer_copy  = UsesLayerCopy(info);
 	const auto  resource    = layer_copy ? LayerResource(handle) : view.resource;
 
 	D3D12_SHADER_RESOURCE_VIEW_DESC desc {};
@@ -612,10 +653,12 @@ D3D12_CPU_DESCRIPTOR_HANDLE Image::UnorderedAccessView(ImageViewHandle handle) {
 	if (view.uav.ptr != 0) {
 		return view.uav;
 	}
-	const auto& info   = view.info;
-	const auto  format = D3D12::GetFormatInfo(info.format);
+	const auto& info       = view.info;
+	const auto  format     = D3D12::GetFormatInfo(info.format);
+	const bool  layer_copy = UsesLayerCopy(info);
+	const auto  resource   = layer_copy ? LayerResource(handle) : view.resource;
 	if (!format.Writable() ||
-	    (backing.resources[view.resource].resource->GetDesc().Flags &
+	    (backing.resources[resource].resource->GetDesc().Flags &
 	     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0) {
 		EXIT("D3D12: image format %d cannot be written by shaders\n",
 		     static_cast<int>(info.format));
@@ -642,7 +685,8 @@ D3D12_CPU_DESCRIPTOR_HANDLE Image::UnorderedAccessView(ImageViewHandle handle) {
 				desc.Texture1DArray.ArraySize       = info.layer_count;
 				break;
 			case vk::ImageViewType::e2D:
-				EXIT_NOT_IMPLEMENTED(info.base_layer != 0);
+				// A later layer is written in its own copy (Use).
+				EXIT_NOT_IMPLEMENTED(info.base_layer != 0 && !layer_copy);
 				desc.ViewDimension      = D3D12_UAV_DIMENSION_TEXTURE2D;
 				desc.Texture2D.MipSlice = info.base_level;
 				break;
@@ -656,7 +700,7 @@ D3D12_CPU_DESCRIPTOR_HANDLE Image::UnorderedAccessView(ImageViewHandle handle) {
 	}
 	view.uav = m_scheduler.Context().GetDescriptorHeap().AllocateCpu(
 	    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-	m_graphics.device->CreateUnorderedAccessView(backing.resources[view.resource].resource, nullptr,
+	m_graphics.device->CreateUnorderedAccessView(backing.resources[resource].resource, nullptr,
 	                                             &desc, view.uav);
 	return view.uav;
 }
