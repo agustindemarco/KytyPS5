@@ -1009,6 +1009,10 @@ void DumpPagerContext(const uint64_t* values, size_t count) {
 	}
 }
 
+std::string DescribePagerWindow(uint64_t address) {
+	return g_guest_address_space != nullptr ? g_guest_address_space->DescribePagerWindow(address) : "no address space";
+}
+
 GuestMemoryTotals GetGuestMemoryTotals() {
 	return g_guest_address_space != nullptr ? g_guest_address_space->GetTotals() : GuestMemoryTotals {};
 }

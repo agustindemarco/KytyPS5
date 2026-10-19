@@ -750,16 +750,31 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 				LOGF("\t%05" PRIx32 "%s %08" PRIx32 "\n", i, (i == offset ? ":" : " "), base[i]);
 			}
 			const auto shown = std::min<uint32_t>(remaining_dw, 4);
+			// Who sent the CP here, and what the pager did with the memory of both buffers.
+			const auto& jump = execution.m_last_jump;
+			std::string where;
+			if (jump.from == nullptr) {
+				where = "last jump: none in this submission (the buffer is the submission's own)\n";
+			} else {
+				where = fmt::format("last jump: from 0x{:016x} ({} dw) at offset 0x{:05x}, chain: {}, packet:",
+				                    reinterpret_cast<uint64_t>(jump.from), jump.from_dw, jump.offset, jump.chain ? "yes" : "no");
+				for (uint32_t i = 0; i < jump.packet_dw; i++) {
+					where += fmt::format(" {:08x}", jump.packet[i]);
+				}
+				where += fmt::format("\n\tpager, jump source: {}\n",
+				                     Libs::LibKernel::Memory::DescribePagerWindow(reinterpret_cast<uint64_t>(jump.from) + uint64_t {jump.offset} * 4));
+			}
+			where += fmt::format("\tpager, buffer: {}\n", Libs::LibKernel::Memory::DescribePagerWindow(reinterpret_cast<uint64_t>(base)));
 			EXIT("unknown op\n\t%05" PRIx32 ":\n\tcmd_id = %08" PRIx32 "\n\tbuffer = 0x%016" PRIx64
 			     " (%" PRIu32 " dw), written by the GPU: %s\n\tnext dwords: %08" PRIx32 " %08" PRIx32
-			     " %08" PRIx32 " %08" PRIx32 "\n",
+			     " %08" PRIx32 " %08" PRIx32 "\n\t%s",
 			     offset, packet_header, reinterpret_cast<uint64_t>(base), total_dw,
 			     m_renderer.GetBufferCache().IsRegionGpuModified(reinterpret_cast<uint64_t>(base),
 			                                                     uint64_t {total_dw} * 4)
 			         ? "yes"
 			         : "no",
 			     packet[0], shown > 1 ? packet[1] : 0u, shown > 2 ? packet[2] : 0u,
-			     shown > 3 ? packet[3] : 0u);
+			     shown > 3 ? packet[3] : 0u, where.c_str());
 		}
 
 		const auto packet_dw =
@@ -771,6 +786,13 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		cursor.offset_dw += packet_dw;
 		execution.m_made_progress = true;
 		if (!execution.m_next_buffer.empty()) {
+			auto& jump     = execution.m_last_jump;
+			jump.from      = packet - (total_dw - remaining_dw);
+			jump.from_dw   = total_dw;
+			jump.offset    = total_dw - remaining_dw;
+			jump.packet_dw = std::min<uint32_t>(packet_dw, static_cast<uint32_t>(jump.packet.size()));
+			std::copy_n(packet, jump.packet_dw, jump.packet.begin());
+			jump.chain = execution.m_chain;
 			// Chains and taken branches reuse the fetcher; only calls retain a return cursor.
 			if (execution.m_chain) {
 				cursor = {execution.m_next_buffer};

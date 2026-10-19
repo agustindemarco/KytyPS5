@@ -1075,27 +1075,13 @@ public:
 		if (!m_lazy_enabled || m_pager_store == nullptr) {
 			return;
 		}
-		const auto now = HistoryNowMs();
 		std::printf("--- Pager context: windows the registers point into ---\n");
 		for (size_t i = 0; i < count; ++i) {
 			const uint64_t value = values[i];
 			if (!m_lazy.Contains(value, 1)) {
 				continue;
 			}
-			const uint64_t      window = value >> Xbox::Lazy::Regions::kWindowBits;
-			PagerWindowHistory  h {};
-			bool                known = false;
-			{
-				std::lock_guard lock(g_history_mutex);
-				if (const auto it = g_history.find(window); it != g_history.end()) {
-					h     = it->second;
-					known = true;
-				}
-			}
-			std::printf("  value %zu = 0x%016" PRIx64 " window 0x%" PRIx64 " flags 0x%02x %s: evicts %u, page ins %u, last evict %" PRId64
-			            " ms ago, last page in %" PRId64 " ms ago (thread %u)\n",
-			            i, value, window, static_cast<unsigned>(m_lazy.FlagsOf(value)), known ? "history" : "never evicted", h.evicts, h.page_ins,
-			            h.evicts != 0 ? now - h.last_evict_ms : -1, h.page_ins != 0 ? now - h.last_page_in_ms : -1, h.last_page_in_thread);
+			std::printf("  value %zu = %s\n", i, PagerWindowLine(value).c_str());
 		}
 		std::fflush(stdout);
 #else
@@ -1104,7 +1090,49 @@ public:
 #endif
 	}
 
+	// Debugging the pager: what happened to the window of this address, as one line (for the unknown op error of the command processor).
+	std::string DescribePagerWindow(uint64_t address) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (!m_lazy_enabled) {
+			return "no lazy memory";
+		}
+		if (m_pager_store == nullptr) {
+			return "pager off";
+		}
+		std::shared_lock lock(m_lazy_mutex);
+		if (!m_lazy.Contains(address, 1)) {
+			return "not in lazy memory";
+		}
+		return PagerWindowLine(address);
+#else
+		(void)address;
+		return "no pager";
+#endif
+	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// The window of an address in lazy memory, its flags and its history with the pager.
+	std::string PagerWindowLine(uint64_t address) const {
+		const uint64_t     window = address >> Xbox::Lazy::Regions::kWindowBits;
+		PagerWindowHistory h {};
+		bool               known = false;
+		{
+			std::lock_guard lock(g_history_mutex);
+			if (const auto it = g_history.find(window); it != g_history.end()) {
+				h     = it->second;
+				known = true;
+			}
+		}
+		const auto now = HistoryNowMs();
+		char       line[256];
+		std::snprintf(line, sizeof(line),
+		              "0x%016" PRIx64 " window 0x%" PRIx64 " flags 0x%02x %s: evicts %u, page ins %u, last evict %" PRId64
+		              " ms ago, last page in %" PRId64 " ms ago (thread %u)",
+		              address, window, static_cast<unsigned>(m_lazy.FlagsOf(address)), known ? "history" : "never evicted", h.evicts, h.page_ins,
+		              h.evicts != 0 ? now - h.last_evict_ms : -1, h.page_ins != 0 ? now - h.last_page_in_ms : -1, h.last_page_in_thread);
+		return line;
+	}
+
 	// Gives a range of lazy memory (all of it reserved, nothing committed) back as placeholders. A window that came back from the pager's store and
 	// went out again is a private reservation of its own, so the range can be several allocations: one call for each. Returns how many (0: failed).
 	static size_t ReleaseLazyRange(uint64_t vaddr, uint64_t size) {

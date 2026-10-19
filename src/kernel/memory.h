@@ -5,6 +5,8 @@
 #include "common/common.h"
 #include "common/virtualMemory.h"
 
+#include <string>
+
 namespace Libs::Graphics {
 class RenderContext;
 enum class PageFaultAccess;
@@ -152,6 +154,8 @@ void                   InstallGpuResources(Graphics::RenderContext* renderer) no
 bool EnsureGuestCommitted(uint64_t vaddr, uint64_t size);
 // Xbox fork (debugging the pager): what happened to the guest memory windows that these values point into (printed when the game crashes).
 void DumpPagerContext(const uint64_t* values, size_t count);
+// Xbox fork (debugging the pager): the window of this address, its flags and what the pager did with it, as one line.
+std::string DescribePagerWindow(uint64_t address);
 // Xbox fork (the overlay): guest memory in RAM (lazily committed windows), in the pager's file, and written to the file and read back since the start, in
 // bytes, and the time the game waited for windows read back since the start. All 0 without lazy memory; the last four 0 and `pager` false without the pager.
 struct GuestMemoryTotals {

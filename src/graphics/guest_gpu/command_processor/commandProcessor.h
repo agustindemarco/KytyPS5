@@ -5,6 +5,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/gpuBackend.h"
 
+#include <array>
 #include <cstdint>
 #include <span>
 #include <string>
@@ -41,8 +42,20 @@ private:
 		uint32_t                  offset_dw = 0;
 	};
 
+	// The last packet that sent the CP into another buffer (an indirect buffer or a taken branch), for the unknown op error: a chain replaces
+	// the buffer it came from, so nothing else remembers it.
+	struct Jump {
+		const uint32_t*          from      = nullptr;
+		uint32_t                 from_dw   = 0;
+		uint32_t                 offset    = 0;
+		uint32_t                 packet_dw = 0;
+		std::array<uint32_t, 15> packet {};
+		bool                     chain     = false;
+	};
+
 	std::vector<BufferCursor> m_buffer_stack;
 	std::span<const uint32_t> m_next_buffer;
+	Jump                      m_last_jump;
 	bool                      m_chain         = false;
 	bool                      m_suspended     = false;
 	bool                      m_made_progress = false;
