@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/frameDump.h"
 #include "graphics/host_gpu/gpuBackend.h"
+#include "graphics/host_gpu/gpuWriteBacks.h"
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
@@ -752,6 +753,11 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			const auto shown = std::min<uint32_t>(remaining_dw, 4);
 			// Who sent the CP here, and what the pager did with the memory of both buffers.
 			const auto& jump = execution.m_last_jump;
+			// And whether the GPU wrote them: the last write-back into them, and the buffer and images that hold them (the CP runs on the GPU thread).
+			const auto gpu = [this](uint64_t address) {
+				return fmt::format("{}\n\t     {}; {}", Graphics::GpuWriteBacks::Describe(address), m_renderer.GetBufferCache().DescribeAddress(address),
+				                   m_renderer.GetTextureCache().DescribeAddress(address));
+			};
 			std::string where;
 			if (jump.from == nullptr) {
 				where = "last jump: none in this submission (the buffer is the submission's own)\n";
@@ -761,10 +767,12 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 				for (uint32_t i = 0; i < jump.packet_dw; i++) {
 					where += fmt::format(" {:08x}", jump.packet[i]);
 				}
-				where += fmt::format("\n\tpager, jump source: {}\n",
-				                     Libs::LibKernel::Memory::DescribePagerWindow(reinterpret_cast<uint64_t>(jump.from) + uint64_t {jump.offset} * 4));
+				const auto source = reinterpret_cast<uint64_t>(jump.from) + uint64_t {jump.offset} * 4;
+				where += fmt::format("\n\tpager, jump source: {}\n", Libs::LibKernel::Memory::DescribePagerWindow(source));
+				where += fmt::format("\tGPU, jump source: {}\n", gpu(source));
 			}
 			where += fmt::format("\tpager, buffer: {}\n", Libs::LibKernel::Memory::DescribePagerWindow(reinterpret_cast<uint64_t>(base)));
+			where += fmt::format("\tGPU, buffer: {}\n", gpu(reinterpret_cast<uint64_t>(base)));
 			EXIT("unknown op\n\t%05" PRIx32 ":\n\tcmd_id = %08" PRIx32 "\n\tbuffer = 0x%016" PRIx64
 			     " (%" PRIu32 " dw), written by the GPU: %s\n\tnext dwords: %08" PRIx32 " %08" PRIx32
 			     " %08" PRIx32 " %08" PRIx32 "\n\t%s",
