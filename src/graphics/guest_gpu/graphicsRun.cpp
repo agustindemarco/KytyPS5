@@ -658,6 +658,13 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain) {
 	EXIT_IF(g_current_execution == nullptr);
 	EXIT_IF(!g_current_execution->m_next_buffer.empty());
+	// Packets the GPU wrote (a shader or a copy on the host GPU) reach guest memory only when read back.
+	const auto address = reinterpret_cast<uint64_t>(commands.data());
+	const auto size    = commands.size_bytes();
+	auto&      cache   = m_renderer.GetBufferCache();
+	if (address != 0 && size != 0 && cache.IsRegionGpuModified(address, size)) {
+		cache.ReadMemory(address, size);
+	}
 	g_current_execution->m_next_buffer = commands;
 	g_current_execution->m_chain       = chain;
 }
@@ -742,8 +749,17 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			for (uint32_t i = dump_begin; i < dump_end; i++) {
 				LOGF("\t%05" PRIx32 "%s %08" PRIx32 "\n", i, (i == offset ? ":" : " "), base[i]);
 			}
-			EXIT("unknown op\n\t%05" PRIx32 ":\n\tcmd_id = %08" PRIx32 "\n",
-			     total_dw - remaining_dw, packet_header);
+			const auto shown = std::min<uint32_t>(remaining_dw, 4);
+			EXIT("unknown op\n\t%05" PRIx32 ":\n\tcmd_id = %08" PRIx32 "\n\tbuffer = 0x%016" PRIx64
+			     " (%" PRIu32 " dw), written by the GPU: %s\n\tnext dwords: %08" PRIx32 " %08" PRIx32
+			     " %08" PRIx32 " %08" PRIx32 "\n",
+			     offset, packet_header, reinterpret_cast<uint64_t>(base), total_dw,
+			     m_renderer.GetBufferCache().IsRegionGpuModified(reinterpret_cast<uint64_t>(base),
+			                                                     uint64_t {total_dw} * 4)
+			         ? "yes"
+			         : "no",
+			     packet[0], shown > 1 ? packet[1] : 0u, shown > 2 ? packet[2] : 0u,
+			     shown > 3 ? packet[3] : 0u);
 		}
 
 		const auto packet_dw =
