@@ -732,10 +732,8 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		            info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp,
 		            info->rsp, info->r8, info->r9, info->r10, info->r11, info->r12, info->r13,
 		            info->r14, info->r15);
-		{
-			const uint64_t registers[] = {info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp, info->r8, info->r9, info->r10, info->r11, info->r12, info->r13, info->r14, info->r15};
-			Libs::LibKernel::Memory::DumpPagerContext(registers, sizeof(registers) / sizeof(registers[0]));
-		}
+		const uint64_t registers[] = {info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp, info->r8, info->r9, info->r10, info->r11, info->r12, info->r13, info->r14, info->r15};
+		Libs::LibKernel::Memory::DumpPagerContext(registers, sizeof(registers) / sizeof(registers[0]));
 		if (IsReadableRange(info->exception_address - 48, 96)) {
 			const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address - 48);
 			std::printf("code (pc-48 .. pc+48, fault at byte 48):");
@@ -755,6 +753,8 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		// What led here: the thread's last library calls, and the game's last text (its own assert message, for one).
 		Libs::CrashTrail::Dump();
 		std::fflush(stdout);
+		// Last: it asks the GPU thread, and waits for it.
+		Libs::LibKernel::Memory::DumpGpuContext(registers, sizeof(registers) / sizeof(registers[0]));
 	}
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
 	     " access=%u address=0x%016" PRIx64 "\n",

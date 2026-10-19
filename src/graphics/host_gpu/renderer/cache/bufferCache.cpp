@@ -8,9 +8,11 @@
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/gpuBackend.h"
+#include "graphics/host_gpu/gpuWriteBacks.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <fmt/format.h>
 #include <cinttypes>
 #include <cstring>
 #include <memory>
@@ -163,6 +165,8 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		for (const auto& copy: copies) {
 			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
 			                                      mapped + (copy.dstOffset - offset), copy.size);
+			GpuWriteBacks::Record(buffer_address + copy.srcOffset, copy.size,
+			                      async ? GpuWriteBacks::Source::BufferDownloadDeferred : GpuWriteBacks::Source::BufferDownload);
 		}
 	};
 	if constexpr (async) {
@@ -530,6 +534,21 @@ bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionGpuModified(vaddr, size);
+}
+
+std::string BufferCache::DescribeAddress(uint64_t vaddr) {
+	const auto candidate = m_buffers.upper_bound(vaddr);
+	if (candidate == m_buffers.begin()) {
+		return "no buffer";
+	}
+	const auto& [address, id] = *std::prev(candidate);
+	const auto& buffer        = m_slot_buffers[id];
+	if (address + buffer.Size() <= vaddr) {
+		return "no buffer";
+	}
+	return fmt::format("buffer 0x{:x}..0x{:x}, these 8 bytes GPU-written (not downloaded yet): {}, page GPU-modified: {}, page CPU-modified: {}",
+	                   address, address + buffer.Size(), m_gpu_modified_ranges.Intersects(vaddr, 8) ? "yes" : "no",
+	                   m_memory_tracker.IsRegionGpuModified(vaddr, 1) ? "yes" : "no", m_memory_tracker.IsRegionCpuModified(vaddr, 1) ? "yes" : "no");
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {

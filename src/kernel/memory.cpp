@@ -12,6 +12,7 @@
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/gpuBackend.h"
+#include "graphics/host_gpu/gpuWriteBacks.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
@@ -20,7 +21,9 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <cinttypes>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <condition_variable>
@@ -29,6 +32,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <semaphore>
 #include <shared_mutex>
 #include <stop_token>
 #include <thread>
@@ -1007,6 +1011,60 @@ void DumpPagerContext(const uint64_t* values, size_t count) {
 	if (g_guest_address_space != nullptr) {
 		g_guest_address_space->DumpPagerContext(values, count);
 	}
+}
+
+void DumpGpuContext(const uint64_t* values, size_t count) {
+	if (g_gpu_resources == nullptr) {
+		return;
+	}
+	std::vector<std::pair<size_t, uint64_t>> mapped;
+	for (size_t i = 0; i < count; ++i) {
+		if (g_gpu_resources->IsMapped(values[i], 1)) {
+			mapped.emplace_back(i, values[i]);
+		}
+	}
+	std::printf("--- GPU context: GPU-visible memory the registers point into ---\n");
+	if (mapped.empty()) {
+		std::printf("  (none)\n");
+		std::fflush(stdout);
+		return;
+	}
+	// Write-backs first: they need nothing from the GPU thread.
+	for (const auto& [index, value]: mapped) {
+		std::printf("  value %zu = 0x%016" PRIx64 ": %s\n", index, value, Graphics::GpuWriteBacks::Describe(value).c_str());
+	}
+	std::fflush(stdout);
+	// The caches belong to the GPU thread: they are asked there, and not waited for long (it may be stuck behind the crashed thread).
+	struct Query {
+		std::binary_semaphore    done {0};
+		std::vector<std::string> lines;
+	};
+	auto  query     = std::make_shared<Query>();
+	auto* resources = g_gpu_resources;
+	auto  describe  = [query, resources, mapped] {
+		for (const auto& entry: mapped) {
+			query->lines.push_back(resources->GetBufferCache().DescribeAddress(entry.second) + "; " +
+			                       resources->GetTextureCache().DescribeAddress(entry.second));
+		}
+		query->done.release();
+	};
+	bool answered = true;
+	if (Graphics::GuestGpu::IsGpuThread()) {
+		describe();
+	} else if (!resources->HasGpu() || resources->GetGpu().IsStopping()) {
+		answered = false;
+	} else {
+		resources->GetGpu().SendCommand(std::move(describe));
+		answered = query->done.try_acquire_for(std::chrono::seconds(2));
+	}
+	if (!answered) {
+		std::printf("  (the GPU thread did not answer: no buffer or image lookup)\n");
+	} else {
+		for (size_t i = 0; i < mapped.size(); ++i) {
+			std::printf("  value %zu: %s\n", mapped[i].first, query->lines[i].c_str());
+		}
+	}
+	std::fflush(stdout);
 }
 
 std::string DescribePagerWindow(uint64_t address) {

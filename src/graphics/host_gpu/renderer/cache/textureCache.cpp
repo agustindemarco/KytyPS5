@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/gpuBackend.h"
+#include "graphics/host_gpu/gpuWriteBacks.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "kernel/memory.h"
@@ -1142,6 +1143,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			std::fill(bytes.begin(), bytes.end(), uint8_t {0xff});
 			m_buffer_cache.InvalidateMemory(address, slice_size);
 			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
+			GpuWriteBacks::Record(address, bytes.size(), GpuWriteBacks::Source::ImageFill);
 		}
 	}
 }
@@ -1799,6 +1801,7 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
 		download.Invalidate(offset, range.size);
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
+		GpuWriteBacks::Record(range.address, range.size, GpuWriteBacks::Source::ImageDownload);
 	});
 	return true;
 }
@@ -1883,6 +1886,25 @@ bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 bool TextureCache::IsRegionRegistered(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	return !FindImagesInRegion(address, size, false).empty();
+}
+
+std::string TextureCache::DescribeAddress(uint64_t address) {
+	std::scoped_lock lock {m_lock};
+	const auto       images = FindImagesInRegion(address, 1, false);
+	if (images.empty()) {
+		return "no image";
+	}
+	std::string line;
+	for (const auto id: images) {
+		const auto* image = m_slot_images.try_get(id);
+		if (image == nullptr) {
+			continue;
+		}
+		line += fmt::format("{}image 0x{:x}..0x{:x} GPU-modified: {}, CPU-dirty: {}", line.empty() ? "" : "; ", image->info.data.address,
+		                    image->info.data.address + image->info.data.size, image->IsGpuModified() ? "yes" : "no",
+		                    image->IsCpuDirty() ? "yes" : "no");
+	}
+	return line.empty() ? "no image" : line;
 }
 
 void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {

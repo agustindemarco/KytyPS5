@@ -154,6 +154,9 @@ void                   InstallGpuResources(Graphics::RenderContext* renderer) no
 bool EnsureGuestCommitted(uint64_t vaddr, uint64_t size);
 // Xbox fork (debugging the pager): what happened to the guest memory windows that these values point into (printed when the game crashes).
 void DumpPagerContext(const uint64_t* values, size_t count);
+// Xbox fork (debugging GPU writes): for each value (the registers of a crash) in GPU-visible memory, the last GPU write-back into it, and the buffer
+// and the images that hold it and whether the GPU wrote them (asked of the GPU thread, which gets 2 s to answer).
+void DumpGpuContext(const uint64_t* values, size_t count);
 // Xbox fork (debugging the pager): the window of this address, its flags and what the pager did with it, as one line.
 std::string DescribePagerWindow(uint64_t address);
 // Xbox fork (the overlay): guest memory in RAM (lazily committed windows), in the pager's file, and written to the file and read back since the start, in

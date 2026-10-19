@@ -20,6 +20,7 @@
 
 #include <map>
 #include <span>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -94,6 +95,8 @@ public:
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// Debugging (the crash context): the buffer that holds this address and whether the GPU wrote it, as one line. On the GPU thread.
+	[[nodiscard]] std::string DescribeAddress(uint64_t vaddr);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBda(const RangeSet& mapped);
 	void               QueueBdaSync(uint64_t vaddr, uint64_t size) {
