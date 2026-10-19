@@ -359,12 +359,12 @@ uint32_t PackedOffset(ValueEmitContext& ctx, IR::Value value, ImageDimension dim
 }
 
 // HostShaderFeatures::unnormalized_samplers_in_shader: texel positions (the sampler's FORCE_UNNORMALIZED) become normalized
-// coordinates, divided by the size of the image's first level; an array layer stays as it is.
+// coordinates, divided by the size of the image's first level (a 3D image's width, height and depth); an array layer stays as it is.
 void NormalizeTexelCoordinates(ValueEmitContext& ctx, const IR::Inst& inst, const IR::ImageResource& candidate,
                                uint32_t resource, uint32_t array_index, uint32_t& coord) {
 	auto& state = ctx.state;
-	if (candidate.cube || candidate.dimension == ImageDimension::Dim3D) {
-		ctx.Fail(inst, "samples a cube or 3D image with texel positions");
+	if (candidate.cube) {
+		ctx.Fail(inst, "samples a cube image with texel positions");
 		return;
 	}
 	const auto& info    = ImageDimensionInfoFor(candidate.dimension);
